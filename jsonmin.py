@@ -340,7 +340,27 @@ def collect_array_paths(arr, jq_path, paths):
                 collect_array_paths(indexed_items[0][1], jq_index_path(jq_path, indexed_items[0][0]), paths)
 
 
-def load_json(source):
+def parse_multiple_json_values(raw):
+    decoder = json.JSONDecoder()
+    values = []
+    pos = 0
+    length = len(raw)
+    while pos < length:
+        # Skip whitespace between values
+        while pos < length and raw[pos] in ' \t\n\r':
+            pos += 1
+        if pos >= length:
+            break
+        try:
+            value, end = decoder.raw_decode(raw, pos)
+        except json.JSONDecodeError:
+            return None
+        values.append(value)
+        pos = end
+    return values if len(values) > 1 else None
+
+
+def load_json(source, debug=False):
     if source == "-":
         if sys.stdin.isatty():
             print("Error: no input (provide a file or pipe JSON to stdin)", file=sys.stderr)
@@ -354,9 +374,27 @@ def load_json(source):
         raw = path.read_text()
 
     try:
-        return json.loads(raw)
+        return json.loads(raw), False
     except json.JSONDecodeError as e:
-        print(f"Error: invalid JSON: {e}", file=sys.stderr)
+        # Try parsing as JSONL / concatenated JSON
+        values = parse_multiple_json_values(raw)
+        if values is not None:
+            print(
+                f"{C['DIM']}(detected {len(values)} JSON values — treating as array){C['RESET']}",
+                file=sys.stderr,
+            )
+            return values, True
+
+        if debug:
+            print(f"Error: invalid JSON: {e}", file=sys.stderr)
+            start = max(0, e.pos - 40)
+            end = min(len(raw), e.pos + 40)
+            snippet = raw[start:end]
+            pointer_offset = e.pos - start
+            print(f"  Context: ...{snippet}...", file=sys.stderr)
+            print(f"           {' ' * (pointer_offset + 3)}^", file=sys.stderr)
+        else:
+            print(f"Error: invalid JSON: {e}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -382,6 +420,11 @@ def build_argument_parser():
         action="store_true",
         help="show flat list of all jq-compatible paths instead of tree",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="show detailed context on parse errors",
+    )
     return parser
 
 
@@ -389,23 +432,77 @@ def main():
     parser = build_argument_parser()
     args = parser.parse_args()
 
-    data = load_json(args.file)
+    data, is_jsonl = load_json(args.file, debug=args.debug)
 
     root_label = type_label(data)
     print(f"\n{C['BOLD']}Root:{C['RESET']} {root_label}\n")
 
-    if args.paths:
-        paths = collect_jq_paths(data)
-        max_path_len = max((len(p) for p, _ in paths), default=0)
-        for path, ptype in paths:
-            color = TYPE_COLORS.get(ptype, C["DIM"])
-            print(f"  {C['BOLD']}{path:<{max_path_len}}{C['RESET']}  {colored(ptype, color)}")
-        print()
-        print(f"{C['DIM']}Use with jq:  cat file.json | jq '<path>'{C['RESET']}")
-        print()
+    if is_jsonl:
+        _display_jsonl(data, args)
+    elif args.paths:
+        _display_paths(data)
     else:
         print_structure(data, "", 0)
         print()
+
+
+def _display_jsonl(data, args):
+    representative = _jsonl_representative(data)
+    if args.paths:
+        paths = collect_jq_paths(representative) if representative else []
+        seen = set()
+        unique_paths = []
+        for entry in paths:
+            if entry[0] not in seen:
+                seen.add(entry[0])
+                unique_paths.append(entry)
+        max_path_len = max((len(p) for p, _ in unique_paths), default=0)
+        for path, ptype in unique_paths:
+            color = TYPE_COLORS.get(ptype, C["DIM"])
+            print(f"  {C['BOLD']}{path:<{max_path_len}}{C['RESET']}  {colored(ptype, color)}")
+        print()
+        _print_jq_hints(jsonl=True)
+        print()
+    else:
+        if representative:
+            print_structure(representative, "", 0)
+        print()
+
+
+def _jsonl_representative(data):
+    objects = [item for item in data if json_type(item) == "object"]
+    if objects:
+        return max(objects, key=lambda o: len(o))
+    return data[0] if data else None
+
+
+def _display_paths(data):
+    paths = collect_jq_paths(data)
+    seen = set()
+    unique_paths = []
+    for entry in paths:
+        if entry[0] not in seen:
+            seen.add(entry[0])
+            unique_paths.append(entry)
+    max_path_len = max((len(p) for p, _ in unique_paths), default=0)
+    for path, ptype in unique_paths:
+        color = TYPE_COLORS.get(ptype, C["DIM"])
+        print(f"  {C['BOLD']}{path:<{max_path_len}}{C['RESET']}  {colored(ptype, color)}")
+    print()
+    _print_jq_hints(jsonl=False)
+    print()
+
+
+def _print_jq_hints(jsonl):
+    file_hint = "file.jsonl" if jsonl else "file.json"
+    d = C["DIM"]
+    r = C["RESET"]
+    b = C["BOLD"]
+    print(f"{d}Use with jq:{r}")
+    print(f"  {d}Single field:     {b}jq '.field' {file_hint}{r}")
+    print(f"  {d}Multiple fields:  {b}jq '{{field1, field2}}' {file_hint}{r}")
+    print(f"  {d}Separate values:  {b}jq '.field1, .field2' {file_hint}{r}")
+    print(f"  {d}Filter + pick:    {b}jq 'select(.field == \"value\") | {{field1, field2}}' {file_hint}{r}")
 
 
 if __name__ == "__main__":
